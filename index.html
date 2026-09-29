@@ -97,7 +97,8 @@ const STRING = col('#eaf2ff', 2.2);
 // ============================================================
 // 区間（街・橋・トンネル）
 // ============================================================
-const START_ZONE = new URLSearchParams(location.search).get('start');   // ?start=bridge / ?start=tunnel ですぐ出す（確認用）
+// ?start=bridge / ?start=tunnel ですぐ出す（確認用）。それ以外の値は無視する
+const START_ZONE = ['bridge', 'tunnel'].find((z) => z === new URLSearchParams(location.search).get('start'));
 const TUNNEL_NAMES = ['山手トンネル', '羽田トンネル', '東京港トンネル', '八重洲トンネル', '千鳥町トンネル'];
 // ?pv&rec: PV を 1280x720 で描いて録画し、ローカルの保存用サーバーへ送る（自動で開始する）
 const REC = new URLSearchParams(location.search).has('rec');
@@ -712,9 +713,10 @@ function buildChunk(k) {
     }
   }
 
-  // 緑の案内標識（トンネル内は天井に当たるので出さない）
+  // 緑の案内標識。トンネル内は天井に、橋の上は斜張ケーブルに当たるので、前後 40m に橋・トンネルがあれば出さない
+  const signSpotOk = (x) => [-40, 0, 40].every((d) => isZone(x + d, 'city'));
   while (nextSignS < s1) {
-    if (nextSignS >= s0 && !isZone(nextSignS, 'tunnel')) buildGantry(B, nextSignS);
+    if (nextSignS >= s0 && signSpotOk(nextSignS)) buildGantry(B, nextSignS);
     nextSignS += rand(380, 800);
   }
 
@@ -840,8 +842,8 @@ function makeVehicle(type, isPlayer) {
 }
 
 const vehicles = [];
-const LANE_CHANGE_PRE = 1.8;
-const laneStats = { ok: 0, gaveUp: 0 };   // 自車の車線変更の結果（録画時に一緒に保存する）     // ウインカーを出してから動き始めるまで [s]
+const LANE_CHANGE_PRE = 1.8;     // ウインカーを出してから動き始めるまで [s]
+const laneStats = { ok: 0, gaveUp: 0 };   // 自車の車線変更の結果（録画時に一緒に保存する）
 
 function spawnVehicle(type, s, lane, speed, isPlayer = false) {
   const v = {
