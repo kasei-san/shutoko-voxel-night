@@ -2,8 +2,8 @@
 
 ![夜の首都高を走るボクセルのセダン](docs/images/hero.jpg)
 
-**▶ ブラウザで見る: https://kasei-san.github.io/shutoko-voxel-night/**
-**▶ PV（約1分）: https://kasei-san.github.io/shutoko-voxel-night/?pv**
+**▶ ブラウザで見る: https://kasei-san.com/shutoko-voxel-night/**
+**▶ PV（約1分）: https://kasei-san.com/shutoko-voxel-night/?pv**
 
 ボクセルアートで夜の首都高を延々と走る Three.js 作品です。
 ネオンのビル群、オレンジの道路照明、ベイブリッジ風の斜張橋、ナトリウム灯のトンネルを、被写界深度のボケと発光で幻想的に描きます。
