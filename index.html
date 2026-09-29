@@ -1,0 +1,1534 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>首都高ボクセルナイト</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #03040a; overflow: hidden; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 14px; bottom: 12px; color: #ffffffaa;
+    font: 12px/1.5 "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+    pointer-events: none; text-shadow: 0 0 6px #000;
+  }
+  #hud b { font-size: 20px; color: #ffd28a; font-weight: 600; }
+  #pvmsg {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    color: #ffffffcc; font: 18px/1.6 "Yu Gothic UI", "Meiryo", system-ui, sans-serif; letter-spacing: 0.1em;
+    pointer-events: none; transition: opacity 1s;
+  }
+  body.pv-running { cursor: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud"></div>
+<div id="pvmsg"></div>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+
+// ============================================================
+// 定数
+// ============================================================
+const LANE_W = 3.5;
+const LANES = [-LANE_W, 0, LANE_W];      // 左から 第1・第2・第3車線（日本は左側通行）
+const ROAD_HALF = 6.4;                   // 路面の半幅（路肩込み）
+const ROAD_Y = 12;                       // 高架の高さ
+const CHUNK = 50;                        // 生成単位 [m]
+const AHEAD = 520, BEHIND = 120;
+const LAMP_GAP = 18;                     // 照明の間隔（左右交互）
+
+const params = {
+  bokeh: true, aperture: 12, maxblur: 0.012,
+  bloom: 0.95, threshold: 0.8, radius: 0.6,
+  exposure: 1.0, fog: 0.0042, traffic: 12, autoCam: true,
+  music: 0.5, sfx: 0.8,
+};
+
+// ============================================================
+// ユーティリティ
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const randInt = (a, b) => Math.floor(rand(a, b));          // [a, b)
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+const chance = (p) => Math.random() < p;
+const col = (hex, k = 1) => new THREE.Color(hex).multiplyScalar(k);
+
+const NEON = ['#ff2bd6', '#00f0ff', '#39ff14', '#ffe600', '#ff6a00', '#b026ff', '#ff1f4b', '#00ff9c', '#4d7cff'];
+const neon = (k) => col(pick(NEON), k);
+
+const C = {
+  asphalt: '#202127', wall: '#6a6c72', pier: '#3c3e44', pole: '#50535a',
+  frame: '#15161b', roof: '#2a2b30', gantry: '#8a8d94', signBack: '#0a3f25',
+  line: col('#8d8f96', 0.55), deli: col('#ffffff', 1.4),
+  glass: '#0b0f18', tire: '#0a0a0b', trim: '#15161a', chassis: '#1a1a1d',
+  tunnelTile: '#b9ae94', tunnelWall: '#4a4a4e', portal: '#5c5d62', truss: '#7c828c',
+};
+const WHITE = new THREE.Color(1, 1, 1);
+const LAMP_EMIT = col('#ffb050', 5);
+const LAMP_HALO = col('#ff9a3c', 0.5);
+const LAMP_POOL = col('#ff8a30', 0.22);
+const HEAD = col('#fff4dc', 3.2);
+const TAIL = col('#ff1a10', 1.4);
+const BRAKE = col('#ff2010', 4.5);
+const AMBER = col('#ffa000', 1.6);
+const TUNNEL_LAMP = col('#ff7a12', 5);        // ナトリウム灯
+const TUNNEL_HALO = col('#ff7a12', 0.35);
+const TUNNEL_POOL = col('#ff7010', 0.18);
+const TOWER = col('#d8e4ff', 0.5);
+const CABLE = col('#e0e8ff', 0.55);
+const STRING = col('#eaf2ff', 2.2);
+
+// ============================================================
+// 区間（街・橋・トンネル）
+// ============================================================
+// ?start=bridge / ?start=tunnel ですぐ出す（確認用）。それ以外の値は無視する
+const START_ZONE = ['bridge', 'tunnel'].find((z) => z === new URLSearchParams(location.search).get('start'));
+const TUNNEL_NAMES = ['山手トンネル', '羽田トンネル', '東京港トンネル', '八重洲トンネル', '千鳥町トンネル'];
+// ?pv&rec: PV を 1280x720 で描いて録画し、ローカルの保存用サーバーへ送る（自動で開始する）
+const REC = new URLSearchParams(location.search).has('rec');
+const PV = REC || new URLSearchParams(location.search).has('pv');
+const REC_W = 1280, REC_H = 720;
+const PV_END = 1600;   // 自車は s=150 から時速90kmくらいで走る。前の車に詰まる分も込みで約1分
+const zones = PV ? [
+  { type: 'city', s0: 0, s1: 330 },
+  { type: 'bridge', s0: 330, s1: 890, towers: [525, 695] },
+  { type: 'city', s0: 890, s1: 1110 },
+  { type: 'tunnel', s0: 1110, s1: 1460, name: '山手トンネル' },
+  { type: 'city', s0: 1460, s1: 2000 },
+] : [{ type: 'city', s0: 0, s1: START_ZONE ? 420 : rand(900, 1400) }];
+function addZone() {
+  const last = zones[zones.length - 1];
+  let type = last.type !== 'city' ? 'city' : chance(0.5) ? 'bridge' : 'tunnel';
+  if (START_ZONE && zones.length === 1) type = START_ZONE;
+  const len = type === 'city' ? rand(700, 1400) : type === 'bridge' ? rand(560, 760) : rand(450, 900);
+  const z = { type, s0: last.s1, s1: last.s1 + len };
+  if (type === 'bridge') z.towers = [z.s0 + len * 0.24, z.s0 + len * 0.76];
+  if (type === 'tunnel') z.name = pick(TUNNEL_NAMES);
+  zones.push(z);
+}
+function zoneAt(s) {
+  while (zones[zones.length - 1].s1 <= s) addZone();
+  for (let i = zones.length - 1; i >= 0; i--) if (zones[i].s0 <= s) return zones[i];
+  return zones[0];
+}
+const isZone = (s, type) => zoneAt(s).type === type;
+// トンネルの奥に入るほど 1（坑口から 40m で完全に切り替わる）
+function tunnelFactor(s) {
+  const z = zoneAt(s);
+  return z.type === 'tunnel' ? THREE.MathUtils.smoothstep(Math.min(s - z.s0, z.s1 - s), 0, 40) : 0;
+}
+
+// ============================================================
+// 道路の中心線（ランダムに左右へ曲がる）
+// ============================================================
+const path = { x: [0], z: [0], h: [0] };   // 1m 刻み。h は進行方向の角度（0 = -Z 方向）
+let curK = 0, targetK = 0, segLeft = 260;
+function extendPath(n) {
+  while (path.x.length <= n) {
+    const i = path.x.length - 1;
+    const h0 = path.h[i];
+    if (segLeft <= 0) {
+      segLeft = rand(80, 260);
+      targetK = chance(0.35) ? 0 : (chance(0.5) ? -1 : 1) / rand(160, 420);
+    }
+    // 向きが横を向きすぎないように戻す（道が自分と交差しないため）
+    if (Math.abs(h0) > 0.8 && Math.sign(targetK) !== -Math.sign(h0)) {
+      targetK = -Math.sign(h0) / rand(200, 300);
+      segLeft = rand(100, 200);
+    }
+    // 橋はまっすぐ架ける（手前 150m から直線に寄せる）
+    if (isZone(i, 'bridge') || isZone(i + 150, 'bridge')) { targetK = 0; curK *= 0.95; }
+    segLeft--;
+    curK += (targetK - curK) * 0.02;
+    const h = h0 + curK;
+    path.h.push(h);
+    path.x.push(path.x[i] + Math.sin(h));
+    path.z.push(path.z[i] - Math.cos(h));
+  }
+}
+// s: 道なり距離, lat: 右向きのオフセット
+function sample(s, lat, out) {
+  extendPath(Math.ceil(s) + 2);
+  const i = Math.max(0, Math.floor(s)), f = s - i;
+  const h = path.h[i] + (path.h[i + 1] - path.h[i]) * f;
+  const x = path.x[i] + (path.x[i + 1] - path.x[i]) * f;
+  const z = path.z[i] + (path.z[i + 1] - path.z[i]) * f;
+  out.x = x + Math.cos(h) * lat;
+  out.z = z + Math.sin(h) * lat;
+  out.h = h;
+  return out;
+}
+const P = { x: 0, z: 0, h: 0 };
+
+// ============================================================
+// テクスチャ
+// ============================================================
+function makeGlowTex() {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+  const g = cv.getContext('2d');
+  const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(255,255,255,1)');
+  gr.addColorStop(0.15, 'rgba(255,255,255,0.6)');
+  gr.addColorStop(0.4, 'rgba(255,255,255,0.15)');
+  gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(cv);
+}
+
+// 窓: 32x32 セル、1セル 8px。セルの左端列・下端行は必ず壁色（屋上の UV がそこを指す）
+const TEXC = 32, CELL = 8, TEXPX = TEXC * CELL;
+const PALETTES = [
+  { w: 5, c: ['#ffffff', '#fff4e0', '#e8f0ff'] },
+  { w: 4, c: ['#ffd9a0', '#fff0c8', '#ffffff'] },
+  { w: 3, c: ['#dfe9ff', '#bcd4ff', '#ffffff'] },
+  { w: 1, c: ['#ffffff', '#7ff8ff', '#40e0ff'] },
+  { w: 1, c: ['#ffffff', '#ff5ce1', '#ff9cf0'] },
+  { w: 1, c: ['#ffffff', '#9dff5c', '#dfff80'] },
+  { w: 2, c: ['#ffffff', '#38f5ff', '#ff3df2', '#b6ff3a', '#ffe43a'] },
+];
+function makeWindowTex(pal) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = TEXPX;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#07080d'; g.fillRect(0, 0, TEXPX, TEXPX);
+  const litRatio = rand(0.35, 0.7);
+  for (let r = 0; r < TEXC; r++) {
+    const rowLit = Math.min(1, litRatio * rand(0.2, 1.8));   // 階ごとに点灯率を変える
+    const rowCol = pick(pal);
+    for (let c = 0; c < TEXC; c++) {
+      if (chance(rowLit)) {
+        g.globalAlpha = rand(0.3, 0.85);
+        g.fillStyle = chance(0.7) ? rowCol : pick(pal);
+      } else {
+        g.globalAlpha = 1;
+        g.fillStyle = '#10131c';
+      }
+      g.fillRect(c * CELL + 1, r * CELL + 1, 6, 5);
+    }
+  }
+  g.globalAlpha = 1;
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.NearestFilter;
+  t.anisotropy = 8;
+  return t;
+}
+function pickPalette() {
+  const total = PALETTES.reduce((a, p) => a + p.w, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < PALETTES.length; i++) { r -= PALETTES[i].w; if (r <= 0) return i; }
+  return 0;
+}
+
+function makeSky() {
+  const cv = document.createElement('canvas'); cv.width = 2; cv.height = 256;
+  const g = cv.getContext('2d');
+  const gr = g.createLinearGradient(0, 0, 0, 256);
+  gr.addColorStop(0, '#020309');
+  gr.addColorStop(0.45, '#0a0a1e');
+  gr.addColorStop(0.62, '#160f2a');
+  gr.addColorStop(1, '#160f2a');
+  g.fillStyle = gr; g.fillRect(0, 0, 2, 256);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// 首都高っぽい緑の案内標識
+const ROUTES = [
+  { mark: 'C1', name: '都心環状線', sub: '銀座・汐留' },
+  { mark: '1', name: '羽田線', sub: '羽田空港・横浜' },
+  { mark: '11', name: '台場線', sub: 'お台場・有明' },
+  { mark: '4', name: '新宿線', sub: '新宿・中央道' },
+  { mark: '3', name: '渋谷線', sub: '渋谷・東名' },
+  { mark: 'B', name: '湾岸線', sub: '葛西・千葉' },
+  { mark: '6', name: '向島線', sub: '箱崎・常磐道' },
+];
+const EXITS = ['霞が関', '銀座', '芝公園', '汐留', '京橋', '飯倉', '一ノ橋', '代官町', '北の丸', '箱崎', '浜町', '新富町'];
+const DESTS = ['浜崎橋', '箱崎', '江戸橋', '谷町', '三宅坂', '羽田', '大井', '横浜', '新宿', '用賀', '葛西', '有明'];
+const SIGN_GREEN = '#0b6e3f', SIGN_WHITE = '#f5f5f5';
+const FONT = (px) => `bold ${px}px "Yu Gothic UI","Yu Gothic","Meiryo","Hiragino Sans","Noto Sans JP",sans-serif`;
+function drawArrow(g, x, y, ang) {
+  g.save(); g.translate(x, y); g.rotate(ang);
+  g.fillRect(-14, -30, 28, 110);
+  g.beginPath(); g.moveTo(0, -95); g.lineTo(-52, -25); g.lineTo(52, -25); g.closePath(); g.fill();
+  g.restore();
+}
+function makeSignTexture() {
+  const W = 1024, H = 352;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  g.fillStyle = SIGN_GREEN; g.fillRect(0, 0, W, H);
+  g.strokeStyle = SIGN_WHITE; g.lineWidth = 10;
+  g.beginPath(); g.roundRect(14, 14, W - 28, H - 28, 22); g.stroke();
+  g.fillStyle = SIGN_WHITE; g.textBaseline = 'middle';
+  const v = Math.random();
+  if (v < 0.4) {
+    const r = pick(ROUTES);
+    g.beginPath(); g.arc(135, 176, 88, 0, Math.PI * 2); g.fill();
+    g.fillStyle = SIGN_GREEN; g.textAlign = 'center';
+    g.font = FONT(r.mark.length > 1 ? 80 : 100); g.fillText(r.mark, 135, 182);
+    g.fillStyle = SIGN_WHITE; g.textAlign = 'left';
+    g.font = FONT(100); g.fillText(r.name, 260, 128);
+    g.font = FONT(62); g.fillText(r.sub, 264, 262);
+    drawArrow(g, 925, 190, pick([0, 0, -0.5, 0.5]));
+  } else if (v < 0.7) {
+    g.fillRect(44, 44, 220, 110);
+    g.fillStyle = SIGN_GREEN; g.textAlign = 'center'; g.font = FONT(78); g.fillText('出口', 154, 102);
+    g.fillStyle = SIGN_WHITE; g.font = FONT(44); g.fillText('EXIT', 154, 200);
+    g.textAlign = 'left'; g.font = FONT(128); g.fillText(pick(EXITS), 300, 140);
+    g.textAlign = 'right'; g.font = FONT(72); g.fillText(pick(['500m', '1km', '2km']), 960, 272);
+    drawArrow(g, 200, 290, -0.9);
+  } else {
+    const ds = [...DESTS].sort(() => Math.random() - 0.5).slice(0, 3);
+    let km = randInt(1, 4);
+    ds.forEach((d, i) => {
+      const y = 88 + i * 90;
+      g.textAlign = 'left'; g.font = FONT(78); g.fillText(d, 80, y);
+      g.textAlign = 'right'; g.fillText(`${km} km`, 950, y);
+      km += randInt(3, 12);
+    });
+  }
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8;
+  return t;
+}
+
+// ============================================================
+// レンダラ・シーン
+// ============================================================
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+// 描画サイズ [幅, 高さ, ピクセル比]。録画時はウィンドウに関係なく固定
+const viewSize = () => REC ? [REC_W, REC_H, 1] : [innerWidth, innerHeight, Math.min(devicePixelRatio, 1.5)];
+renderer.setPixelRatio(viewSize()[2]);
+renderer.setSize(viewSize()[0], viewSize()[1]);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = params.exposure;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = makeSky();
+scene.fog = new THREE.FogExp2(0x160f2a, params.fog);
+
+const camera = new THREE.PerspectiveCamera(55, viewSize()[0] / viewSize()[1], 0.5, 900);
+camera.layers.enable(1);   // layer 1 = 光のにじみ類（被写界深度の深度バッファには入れない）
+
+const hemi = new THREE.HemisphereLight(0x303a70, 0x0a0608, 0.6);
+scene.add(hemi);
+// 屋外とトンネル内の環境光・霧。トンネル内はナトリウム灯で車も壁もオレンジに染まる
+const AMBIENT = {
+  sky: [new THREE.Color(0x303a70), new THREE.Color(0xff8a2a)],
+  ground: [new THREE.Color(0x0a0608), new THREE.Color(0x5a2a08)],
+  intensity: [0.6, 2.4],
+  fog: [new THREE.Color(0x160f2a), new THREE.Color(0x3a1a06)],
+};
+const moon = new THREE.DirectionalLight(0x6070b0, 0.25);
+moon.position.set(-1, 2, 1);
+scene.add(moon);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(4000, 4000).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ color: 0x07080c, roughness: 1 }),
+);
+scene.add(ground);
+
+// 車体に映り込ませる夜の街の環境マップ
+function makeEnvMap() {
+  const es = new THREE.Scene();
+  es.background = new THREE.Color(0x05060c);
+  const box = (w, h, d, x, y, z, c) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshBasicMaterial({ color: c }));
+    m.position.set(x, y, z); es.add(m);
+  };
+  for (let i = 0; i < 9; i++) for (const sx of [-1, 1]) box(1, 0.3, 3, sx * 6, 10, -40 + i * 10, new THREE.Color(3, 1.5, 0.4));
+  for (let i = 0; i < 30; i++) {
+    const sx = chance(0.5) ? -1 : 1;
+    box(1, rand(2, 8), rand(2, 8), sx * 30, rand(0, 20), rand(-60, 60), neon(1.5));
+  }
+  const pm = new THREE.PMREMGenerator(renderer);
+  const tex = pm.fromScene(es, 0.02).texture;
+  pm.dispose();
+  return tex;
+}
+
+const glowTex = makeGlowTex();
+const ENV_MAP = makeEnvMap();
+const additive = { transparent: true, blending: THREE.AdditiveBlending, depthWrite: false };
+const MAT = {
+  lit: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9 }),
+  emit: new THREE.MeshBasicMaterial({ vertexColors: true }),
+  decal: new THREE.MeshBasicMaterial({ vertexColors: true, map: glowTex, ...additive }),
+  lampPts: new THREE.PointsMaterial({ size: 7, map: glowTex, vertexColors: true, ...additive }),
+  airPts: new THREE.PointsMaterial({ size: 5, map: glowTex, vertexColors: true, ...additive }),
+  tlampPts: new THREE.PointsMaterial({ size: 3.5, map: glowTex, vertexColors: true, ...additive }),
+  win: PALETTES.map((p) => new THREE.MeshBasicMaterial({ map: makeWindowTex(p.c) })),
+  car: new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.32, metalness: 0.35,
+    envMap: ENV_MAP, envMapIntensity: 0.9,
+  }),
+  blinkOn: new THREE.MeshBasicMaterial({ color: new THREE.Color(4, 1.6, 0.1) }),
+  blinkOff: new THREE.MeshBasicMaterial({ color: 0x3a2000 }),
+  water: new THREE.MeshStandardMaterial({ color: 0x040a18, roughness: 0.25, metalness: 0.6, envMap: ENV_MAP, envMapIntensity: 0.5 }),
+  shadow: new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.55, depthWrite: false }),
+  headPool: new THREE.MeshBasicMaterial({ color: new THREE.Color(0.25, 0.23, 0.19), map: glowTex, ...additive }),
+  tailPool: new THREE.MeshBasicMaterial({ color: new THREE.Color(0.18, 0.01, 0.01), map: glowTex, ...additive }),
+};
+
+// ============================================================
+// ジオメトリ組み立て
+// ============================================================
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _e = new THREE.Euler();
+const _p = new THREE.Vector3(), _one = new THREE.Vector3(1, 1, 1), _col = new THREE.Color();
+
+function colorize(geo, c) {
+  const cc = c.isColor ? c : _col.set(c);
+  const n = geo.attributes.position.count, a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { a[i * 3] = cc.r; a[i * 3 + 1] = cc.g; a[i * 3 + 2] = cc.b; }
+  geo.setAttribute('color', new THREE.BufferAttribute(a, 3));
+  return geo;
+}
+// 道路座標 (s, lat, y) に置く。ローカルの -Z が進行方向、+X が右
+function placeGeo(geo, s, lat, y) {
+  sample(s, lat, P);
+  _e.set(0, -P.h, 0); _q.setFromEuler(_e); _p.set(P.x, y, P.z);
+  _m.compose(_p, _q, _one);
+  return geo.applyMatrix4(_m);
+}
+function placeObj(o, s, lat, y) {
+  sample(s, lat, P);
+  o.position.set(P.x, y, P.z);
+  o.rotation.set(0, -P.h, 0);
+}
+
+class Builder {
+  constructor() {
+    this.lists = { lit: [], emit: [], decal: [], water: [] };
+    this.win = PALETTES.map(() => []);
+    this.pts = { lamp: [], air: [], tlamp: [] };
+    this.extras = []; this.owned = [];
+  }
+  // w: 横幅（道路の左右方向）, h: 高さ, d: 奥行（道なり方向）
+  box(list, s, lat, y, w, h, d, c) {
+    this.lists[list].push(placeGeo(colorize(new THREE.BoxGeometry(w, h, d), c), s, lat, y));
+  }
+  decal(s, lat, w, d, c, y = ROAD_Y + 0.05) {
+    const g = new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2);
+    this.lists.decal.push(placeGeo(colorize(g, c), s, lat, y));
+  }
+  // 2点を結ぶ細い角材（ケーブル・トラスの斜材）
+  segment(list, sA, latA, yA, sB, latB, yB, thick, c) {
+    sample(sA, latA, P); const a = new THREE.Vector3(P.x, yA, P.z);
+    sample(sB, latB, P); const b = new THREE.Vector3(P.x, yB, P.z);
+    const dir = b.clone().sub(a), len = dir.length();
+    const g = colorize(new THREE.BoxGeometry(thick, thick, len), c);
+    _q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir.normalize());
+    _m.compose(a.add(b).multiplyScalar(0.5), _q, _one);
+    this.lists[list].push(g.applyMatrix4(_m));
+  }
+  point(kind, s, lat, y, c) {
+    sample(s, lat, P);
+    this.pts[kind].push(P.x, y, P.z, c.r, c.g, c.b);
+  }
+  building(s, lat, w, h, d, pal) {
+    const g = new THREE.BoxGeometry(w, h, d);
+    const uv = g.attributes.uv;
+    const offU = randInt(0, TEXC) / TEXC, offV = randInt(0, TEXC) / TEXC;
+    const rows = Math.max(1, Math.round(h / 3.4));
+    for (let f = 0; f < 6; f++) {
+      const cols = Math.max(1, Math.round((f < 2 ? d : w) / 3.2));
+      for (let k = 0; k < 4; k++) {
+        const i = f * 4 + k;
+        if (f === 2 || f === 3) { uv.setXY(i, 0.5 / TEXPX, 0.5 / TEXPX); continue; }   // 屋上・底面は壁色
+        uv.setXY(i, uv.getX(i) * cols / TEXC + offU, uv.getY(i) * rows / TEXC + offV);
+      }
+    }
+    this.win[pal].push(placeGeo(g, s, lat, h / 2));
+  }
+  finish() {
+    const group = new THREE.Group();
+    const add = (geos, mat, layer = 0) => {
+      if (!geos.length) return;
+      const m = new THREE.Mesh(mergeGeometries(geos), mat);
+      geos.forEach((x) => x.dispose());
+      if (layer) m.layers.set(layer);
+      m.matrixAutoUpdate = false;
+      group.add(m);
+    };
+    add(this.lists.lit, MAT.lit);
+    add(this.lists.emit, MAT.emit);
+    add(this.lists.decal, MAT.decal, 1);
+    add(this.lists.water, MAT.water);
+    this.win.forEach((geos, i) => add(geos, MAT.win[i]));
+    for (const [kind, mat] of [['lamp', MAT.lampPts], ['air', MAT.airPts], ['tlamp', MAT.tlampPts]]) {
+      const a = this.pts[kind];
+      if (!a.length) continue;
+      const n = a.length / 6, pos = new Float32Array(n * 3), cl = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) for (let j = 0; j < 3; j++) { pos[i * 3 + j] = a[i * 6 + j]; cl[i * 3 + j] = a[i * 6 + 3 + j]; }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('color', new THREE.BufferAttribute(cl, 3));
+      const pts = new THREE.Points(g, mat);
+      pts.layers.set(1);
+      group.add(pts);
+    }
+    this.extras.forEach((o) => group.add(o));
+    return group;
+  }
+}
+
+// ============================================================
+// チャンク生成（道路・照明・ビル・看板・標識）
+// ============================================================
+const lamps = [];                                  // PointLight を割り当てる候補
+const bCursor = { '-1': [0, 0], '1': [0, 0] };     // ビルの配置位置（チャンク境界で重ならないように持ち越す）
+let nextSignS = PV ? 960 : 330;
+
+function decorate(B, s, lat, w, h, d, side) {
+  const face = lat - side * w / 2;       // 道路側の壁面
+  const r = Math.random();
+  if (h > 14 && r < 0.35) {
+    // 屋上看板
+    const bh = rand(3, 7), bl = d * rand(0.55, 0.9), y = h + 1.2 + bh / 2, bLat = face + side * 1.5;
+    B.box('lit', s - bl * 0.35, bLat, h + 0.6, 0.3, 1.2, 0.3, C.frame);
+    B.box('lit', s + bl * 0.35, bLat, h + 0.6, 0.3, 1.2, 0.3, C.frame);
+    B.box('lit', s, bLat + side * 0.2, y, 0.3, bh + 0.5, bl + 0.5, C.frame);
+    B.box('emit', s, bLat, y, 0.3, bh, bl, neon(1.3));
+    const n = randInt(2, 6), lc = chance(0.5) ? col('#ffffff', 2) : neon(2);
+    for (let i = 0; i < n; i++) {
+      B.box('emit', s - bl / 2 + (i + 0.5) * bl / n, bLat - side * 0.2, y + rand(-0.15, 0.15) * bh,
+        0.12, bh * rand(0.4, 0.65), bl / n * 0.55, lc);
+    }
+  } else if (h > 16 && r < 0.65) {
+    // ビルの端から突き出す縦看板
+    const H = rand(6, Math.min(24, h - 4)), y = rand(3, h - H - 1) + H / 2;
+    const sc = s + (chance(0.5) ? -1 : 1) * (d / 2 - 0.8), lt = face - side * 1.3;
+    B.box('emit', sc, lt, y, 2.0, H, 0.35, neon(1.3));
+    const n = Math.max(2, Math.floor(H / 2.2)), lc = chance(0.5) ? col('#ffffff', 2) : neon(2);
+    for (let i = 0; i < n; i++) B.box('emit', sc, lt, y - H / 2 + (i + 0.5) * H / n, 1.3, H / n * 0.62, 0.45, lc);
+  } else if (r < 0.8) {
+    // 屋上付近を一周するネオン帯
+    B.box('emit', s, lat, h - rand(0.8, 3), w + 0.25, rand(0.3, 0.8), d + 0.25, neon(1.2));
+  }
+  if (h > 10 && chance(0.3)) {
+    B.box('emit', s + rand(-d / 4, d / 4), face - side * 0.2, rand(4, h - 3), 0.2, rand(1.2, 3), rand(3, 8), neon(1.3));
+  }
+  if (chance(0.6)) B.box('lit', s + rand(-d / 4, d / 4), lat + rand(-w / 4, w / 4), h + 0.9, rand(2, 4), 1.8, rand(2, 4), C.roof);
+  if (h > 70) {
+    B.box('lit', s, lat, h + 3, 0.3, 6, 0.3, C.frame);
+    B.point('air', s, lat, h + 6.2, col('#ff2020', 1.5));
+  }
+}
+
+function buildGantry(B, s) {
+  for (const side of [-1, 1]) B.box('lit', s, side * (ROAD_HALF + 0.9), ROAD_Y + 4.6, 0.5, 9.2, 0.5, C.gantry);
+  B.box('lit', s, 0, ROAD_Y + 8.9, 2 * ROAD_HALF + 2.4, 0.55, 0.55, C.gantry);
+  const lat = pick([-2.2, 0, 2.2]), bw = 9.4, bh = 3.25, y = ROAD_Y + 7.0;
+  B.box('lit', s + 0.1, lat, y, bw + 0.3, bh + 0.3, 0.25, C.signBack);
+  const tex = makeSignTexture();
+  const mat = new THREE.MeshBasicMaterial({ map: tex, color: 0xd0d0d0 });
+  const geo = new THREE.PlaneGeometry(bw, bh);
+  const mesh = new THREE.Mesh(geo, mat);
+  placeObj(mesh, s - 0.08, lat, y);          // 手前（接近してくる車側）を向く
+  B.extras.push(mesh); B.owned.push(tex, mat);
+  for (let i = -1; i <= 1; i++) {
+    B.box('emit', s - 0.6, lat + i * 3, ROAD_Y + 8.75, 0.5, 0.15, 0.3, col('#fff2d0', 2.5));
+    B.point('lamp', s - 0.6, lat + i * 3, ROAD_Y + 8.6, col('#fff2d0', 0.25));
+  }
+}
+
+function buildPortal(B, s, z, entrance) {
+  for (const side of [-1, 1]) B.box('lit', s, side * 9.2, ROAD_Y + 4.5, 3.8, 13, 2.5, C.portal);
+  B.box('lit', s, 0, ROAD_Y + 9.6, 22.2, 3.4, 2.5, C.portal);
+  B.box('emit', s + (entrance ? -1.3 : 1.3), 0, ROAD_Y + 7.95, 14, 0.12, 0.12, col('#ff8a20', 2));
+  if (!entrance) return;
+  const cv = document.createElement('canvas'); cv.width = 512; cv.height = 96;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#1a1c22'; g.fillRect(0, 0, 512, 96);
+  g.fillStyle = '#f0f0f0'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = FONT(64); g.fillText(z.name, 256, 50);
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, color: 0xb0b0b0 });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(8, 1.5), mat);
+  placeObj(mesh, s - 1.3, 0, ROAD_Y + 9.7);
+  B.extras.push(mesh); B.owned.push(tex, mat);
+}
+
+// ベイブリッジ風の H 型主塔と斜張ケーブル
+function buildTower(B, ts, z) {
+  const legLat = ROAD_HALF + 3.2, top = ROAD_Y + 62;
+  for (const side of [-1, 1]) {
+    B.box('emit', ts, side * legLat, top / 2, 3.2, top, 4.5, TOWER);
+    B.box('emit', ts - 2.3, side * legLat, top / 2, 0.8, top, 0.1, col('#ffffff', 1.3));   // 塔のライトアップ
+    B.point('air', ts, side * legLat, top + 0.6, col('#ff2020', 1.5));
+    B.decal(ts + 30, side * legLat, 5, 70, col('#9fb8ff', 0.22), 0.4);                     // 水面に映る光
+    for (const dir of [-1, 1]) {
+      // 外側は橋の端まで、内側はもう一方の主塔との中間まで
+      const other = z.towers.find((x) => x !== ts && Math.sign(x - ts) === dir);
+      let reach = dir < 0 ? ts - z.s0 - 10 : z.s1 - ts - 10;
+      if (other !== undefined) reach = Math.min(reach, Math.abs(other - ts) / 2 - 2);
+      const n = Math.min(12, Math.floor(reach / 16));
+      for (let j = 1; j <= n; j++) {
+        B.segment('emit', ts + dir * 1.8, side * legLat, ROAD_Y + 58 - j * 2.2,
+          ts + dir * j * 16, side * (ROAD_HALF + 1.2), ROAD_Y + 0.8, 0.14, CABLE);
+      }
+    }
+  }
+  for (const [y, h] of [[ROAD_Y - 3, 2.5], [ROAD_Y + 30, 3], [ROAD_Y + 59, 4]]) {
+    B.box('emit', ts, 0, y, 2 * legLat + 3.2, h, 4, TOWER);
+  }
+  return Math.min(ts + 12 * 16, z.s1) + 5;    // ケーブルが届く一番先
+}
+
+const chunkLamp = (list, s, lat, y) => list.push({ s, lat, y });
+
+function buildChunk(k) {
+  const s0 = k * CHUNK, s1 = s0 + CHUNK;
+  extendPath(s1 + 200);
+  const B = new Builder();
+  const newLamps = [];
+  let maxS = s1;
+
+  // 路面・壁・白線・橋脚 / 橋のトラス / トンネルの躯体
+  for (let s = s0; s < s1; s += 2) {
+    const sc = s + 1, zt = zoneAt(sc).type;
+    B.box('lit', sc, 0, ROAD_Y - 0.8, 2 * ROAD_HALF + 1.2, 1.6, 2.3, C.asphalt);
+    for (const side of [-1, 1]) {
+      B.box('emit', sc, side * 5.3, ROAD_Y, 0.16, 0.04, 2.2, C.line);
+      if (s % 20 < 8) B.box('emit', sc, side * 1.75, ROAD_Y, 0.14, 0.04, 2.0, C.line);
+      if (zt === 'tunnel') {
+        B.box('lit', sc, side * 7.3, ROAD_Y + 1.25, 0.6, 2.5, 2.3, C.tunnelTile);
+        B.box('lit', sc, side * 7.3, ROAD_Y + 5.0, 0.6, 5.0, 2.3, C.tunnelWall);
+        B.box('lit', sc, side * 6.6, ROAD_Y + 7.0, 1.2, 1.2, 2.3, C.tunnelWall);
+        if (s % 4 === 0) B.box('emit', sc, side * 6.92, ROAD_Y + 5.4, 0.2, 0.28, 1.5, TUNNEL_LAMP);
+        if (s % 8 === 0) B.point('tlamp', sc, side * 6.7, ROAD_Y + 5.3, TUNNEL_HALO);
+        if (s % 50 === 0) B.box('emit', sc, side * 6.97, ROAD_Y + 2.8, 0.1, 0.5, 0.9, side < 0 ? col('#19ff6a', 1.5) : col('#ff2a2a', 1.5));
+      } else {
+        B.box('lit', sc, side * (ROAD_HALF + 0.3), ROAD_Y + 0.55, 0.6, 1.1, 2.3, C.wall);
+        if (s % 10 === 0) B.box('emit', sc, side * (ROAD_HALF - 0.02), ROAD_Y + 0.95, 0.06, 0.12, 0.12, C.deli);
+      }
+      if (zt === 'bridge') {
+        B.box('lit', sc, side * (ROAD_HALF + 0.4), ROAD_Y - 4.6, 0.5, 0.5, 2.3, C.truss);
+        if (s % 10 === 0) {
+          B.box('lit', sc, side * (ROAD_HALF + 0.4), ROAD_Y - 3.1, 0.4, 3.0, 0.4, C.truss);
+          const up = s % 20 === 0 ? 1 : -1;
+          B.segment('lit', sc, side * (ROAD_HALF + 0.4), ROAD_Y - (up > 0 ? 4.6 : 1.6),
+            sc + 10, side * (ROAD_HALF + 0.4), ROAD_Y - (up > 0 ? 1.6 : 4.6), 0.3, C.truss);
+        }
+        if (s % 6 === 0) {
+          B.box('emit', sc, side * (ROAD_HALF + 0.75), ROAD_Y - 1.4, 0.15, 0.15, 0.15, STRING);
+          B.point('tlamp', sc, side * (ROAD_HALF + 0.75), ROAD_Y - 1.4, col('#cfe0ff', 0.15));
+        }
+      }
+    }
+    if (zt === 'tunnel') {
+      B.box('lit', sc, 0, ROAD_Y + 7.9, 15.2, 0.6, 2.3, C.tunnelWall);
+      if (s % 12 === 0) {
+        const side = s % 24 === 0 ? 1 : -1;
+        B.decal(sc, side * 3.5, 9, 12, TUNNEL_POOL);
+        chunkLamp(newLamps, sc, side * 6.7, ROAD_Y + 5.3);
+      }
+      if (s % 100 === 0) for (const side of [-1, 1]) B.box('lit', sc, side * 3, ROAD_Y + 6.9, 1.2, 1.2, 4, C.pole);   // ジェットファン
+    }
+    if (zt === 'bridge') {
+      if (s % 10 === 0) B.box('lit', sc, 0, ROAD_Y - 4.6, 2 * ROAD_HALF + 1.2, 0.4, 0.4, C.truss);
+    } else if (s % 30 === 0) {
+      B.box('lit', sc, 0, (ROAD_Y - 1.6) / 2, 3, ROAD_Y - 1.6, 2.6, C.pier);
+      B.box('lit', sc, 0, ROAD_Y - 2.2, 12, 1.2, 2.6, C.pier);
+    }
+  }
+
+  // オレンジの道路照明（左右交互・等間隔）。トンネル内は壁の照明に任せる
+  for (let s = Math.ceil(s0 / LAMP_GAP) * LAMP_GAP; s < s1; s += LAMP_GAP) {
+    const zt = zoneAt(s).type;
+    if (zt === 'tunnel') continue;
+    const side = Math.round(s / LAMP_GAP) % 2 === 0 ? 1 : -1;
+    B.box('lit', s, side * (ROAD_HALF + 0.35), ROAD_Y + 5.7, 0.3, 9, 0.3, C.pole);
+    B.box('lit', s, side * (ROAD_HALF - 0.9), ROAD_Y + 10.4, 2.6, 0.22, 0.25, C.pole);
+    B.box('emit', s, side * (ROAD_HALF - 2.0), ROAD_Y + 10.25, 1.3, 0.2, 0.55, LAMP_EMIT);
+    B.point('lamp', s, side * (ROAD_HALF - 2.0), ROAD_Y + 10.0, LAMP_HALO);
+    B.decal(s, side * (ROAD_HALF - 3.5), 13, 16, LAMP_POOL);
+    if (zt === 'bridge') B.decal(s, side * rand(12, 40), 2.5, 45, col('#ff8a30', 0.18), 0.4);
+    chunkLamp(newLamps, s, side * (ROAD_HALF - 2.0), ROAD_Y + 10);
+  }
+
+  // トンネルの坑口と、橋の主塔
+  for (const z of zones) {
+    if (z.type === 'tunnel') {
+      if (z.s0 >= s0 && z.s0 < s1) buildPortal(B, z.s0, z, true);
+      if (z.s1 >= s0 && z.s1 < s1) buildPortal(B, z.s1, z, false);
+    }
+    if (z.type === 'bridge') for (const ts of z.towers) if (ts >= s0 && ts < s1) maxS = Math.max(maxS, buildTower(B, ts, z));
+  }
+
+  // 橋の下の海と、遠くの街明かり
+  const mid = s0 + CHUNK / 2, zm = zoneAt(mid);
+  const nearBridge = zm.type === 'bridge' || isZone(mid - 40, 'bridge') || isZone(mid + 40, 'bridge');
+  if (nearBridge) {
+    B.lists.water.push(placeGeo(new THREE.PlaneGeometry(1000, CHUNK + 0.5).rotateX(-Math.PI / 2), mid, 0, 0.3));
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < 2; i++) {
+        const w = rand(15, 40), h = rand(20, 140);
+        B.building(s0 + rand(0, CHUNK), side * rand(220, 420), w, h, rand(15, 40), pickPalette());
+      }
+    }
+  }
+
+  // ビル（橋の区間には建てない）
+  for (const side of [-1, 1]) {
+    for (let row = 0; row < 2; row++) {
+      let s = Math.max(s0, bCursor[side][row]);
+      while (s < s1) {
+        const d = rand(8, 24);
+        if (chance(0.08)) { s += rand(8, 20); continue; }        // 空き地
+        if (isZone(s - 20, 'bridge') || isZone(s + d + 20, 'bridge')) { s += d; continue; }
+        const w = row === 0 ? rand(10, 24) : rand(12, 30);
+        const gap = row === 0 ? rand(7, 16) : rand(50, 66);
+        const lat = side * (ROAD_HALF + gap + w / 2);
+        const h = row === 0
+          ? (chance(0.6) ? rand(9, 34) : chance(0.75) ? rand(34, 70) : rand(70, 120))
+          : rand(25, 150);
+        const sc = s + d / 2;
+        B.building(sc, lat, w, h, d, pickPalette());
+        decorate(B, sc, lat, w, h, d, side);
+        s += d + rand(1.5, 6);
+      }
+      bCursor[side][row] = s;
+    }
+  }
+
+  // 緑の案内標識。トンネル内は天井に、橋の上は斜張ケーブルに当たるので、前後 40m に橋・トンネルがあれば出さない
+  const signSpotOk = (x) => [-40, 0, 40].every((d) => isZone(x + d, 'city'));
+  while (nextSignS < s1) {
+    if (nextSignS >= s0 && signSpotOk(nextSignS)) buildGantry(B, nextSignS);
+    nextSignS += rand(380, 800);
+  }
+
+  newLamps.sort((a, b) => a.s - b.s);
+  lamps.push(...newLamps);
+
+  const group = B.finish();
+  scene.add(group);
+  return { group, owned: B.owned, maxS };
+}
+
+function disposeChunk(c) {
+  scene.remove(c.group);
+  c.group.traverse((o) => o.geometry && o.geometry.dispose());
+  c.owned.forEach((x) => x.dispose());
+}
+
+const chunks = new Map();
+function updateChunks(ps) {
+  const kMin = Math.floor((ps - BEHIND) / CHUNK), kMax = Math.floor((ps + AHEAD) / CHUNK);
+  // 主塔のケーブルはチャンクの外まで伸びるので、先端が後ろに過ぎるまで残す
+  for (const [k, c] of chunks) if (k < kMin && c.maxS < ps - BEHIND) { disposeChunk(c); chunks.delete(k); }
+  for (let k = Math.max(0, kMin); k <= kMax; k++) if (!chunks.has(k)) chunks.set(k, buildChunk(k));
+}
+
+// ============================================================
+// 車両
+// ============================================================
+const SEDAN_COLORS = ['#e8e8ea', '#1a1a1f', '#8a8f99', '#7a0d12', '#0e2a5a', '#c9c2b0', '#2f3b2a', '#d9d4c8', '#3a3d44'];
+const BUS_STRIPES = [['#1b5fb8', '#e8452c'], ['#1f8a4c', '#f2c230'], ['#8a1b3a', '#d9a441'], ['#2a2a7a', '#48a8e0']];
+
+function makeVehicle(type, isPlayer) {
+  const body = [], emit = [], tail = [], bl = [], br = [];
+  const V = (list, w, h, d, x, y, z, c) => {
+    const g = new THREE.BoxGeometry(w, h, d); g.translate(x, y, z); list.push(colorize(g, c));
+  };
+  let len, wid;
+  if (type === 'sedan') {
+    len = 4.7; wid = 1.82;
+    const paint = isPlayer ? '#e6eaf0' : pick(SEDAN_COLORS);
+    V(body, 1.82, 0.56, 4.7, 0, 0.6, 0, paint);
+    V(body, 1.64, 0.5, 2.3, 0, 1.12, 0.25, C.glass);
+    V(body, 1.58, 0.1, 1.9, 0, 1.42, 0.3, paint);
+    V(body, 1.86, 0.2, 0.14, 0, 0.42, -2.36, C.trim);
+    V(body, 1.86, 0.2, 0.14, 0, 0.42, 2.36, C.trim);
+    for (const x of [-0.84, 0.84]) for (const z of [-1.45, 1.45]) V(body, 0.3, 0.64, 0.68, x, 0.32, z, C.tire);
+    for (const x of [-0.98, 0.98]) V(body, 0.18, 0.12, 0.2, x, 1.0, -0.8, paint);
+    for (const x of [-0.56, 0.56]) {
+      V(emit, 0.42, 0.14, 0.06, x, 0.74, -2.36, HEAD);
+      V(tail, 0.42, 0.14, 0.06, x, 0.76, 2.36, WHITE);
+    }
+    V(tail, 0.5, 0.05, 0.05, 0, 0.8, 2.36, WHITE);
+    V(emit, 0.42, 0.2, 0.04, 0, 0.5, 2.44, col('#dcdcd0', 0.5));
+    for (const [list, sx] of [[bl, -1], [br, 1]]) {
+      V(list, 0.14, 0.12, 0.07, sx * 0.84, 0.74, -2.36, WHITE);
+      V(list, 0.14, 0.12, 0.07, sx * 0.84, 0.76, 2.36, WHITE);
+      V(list, 0.06, 0.08, 0.14, sx * 1.08, 1.0, -0.8, WHITE);
+    }
+  } else if (type === 'truck') {
+    len = 10; wid = 2.5;
+    const cab = pick(['#e8e8e8', '#2d5fa8', '#1d7a4a', '#c23a2a', '#e8e8e8']);
+    V(body, 2.2, 0.45, 9.6, 0, 0.8, 0.1, C.chassis);
+    V(body, 2.4, 2.3, 2.1, 0, 2.05, -3.9, cab);
+    V(body, 2.2, 0.95, 0.06, 0, 2.6, -4.96, C.glass);
+    V(body, 2.44, 0.75, 0.9, 0, 2.6, -4.2, C.glass);
+    V(body, 2.3, 0.25, 0.35, 0, 1.05, -5.0, C.trim);
+    V(body, 2.5, 2.95, 7.4, 0, 2.5, 1.2, pick(['#b8bdc6', '#d9d9d9', '#9aa3ad']));
+    V(body, 2.52, 0.4, 7.2, 0, 1.6, 1.2, pick(['#c8102e', '#0057b8', '#009944', '#f39800']));
+    V(body, 2.3, 0.3, 0.2, 0, 0.7, 4.95, C.trim);
+    for (const z of [-3.7, 2.6, 3.8]) for (const x of [-1.02, 1.02]) V(body, 0.42, 1.0, 1.0, x, 0.5, z, C.tire);
+    for (const x of [-0.8, 0.8]) V(emit, 0.34, 0.14, 0.06, x, 1.25, -4.98, HEAD);
+    for (const x of [-0.85, -0.55, 0.55, 0.85]) V(tail, 0.24, 0.2, 0.06, x, 1.1, 4.93, WHITE);
+    for (const [list, sx] of [[bl, -1], [br, 1]]) {
+      V(list, 0.2, 0.14, 0.07, sx * 1.1, 1.25, -4.98, WHITE);
+      V(list, 0.2, 0.2, 0.07, sx * 1.12, 1.1, 4.93, WHITE);
+    }
+    if (chance(0.6)) {   // マーカーランプ
+      for (let z = -2; z <= 4.5; z += 1.3) for (const x of [-1.27, 1.27]) V(emit, 0.08, 0.14, 0.22, x, 1.2, z, AMBER);
+      for (let i = -2; i <= 2; i++) V(emit, 0.2, 0.1, 0.1, i * 0.45, 3.28, -4.9, AMBER);
+    }
+  } else {
+    len = 12; wid = 2.5;
+    const [s1c, s2c] = pick(BUS_STRIPES);
+    V(body, 2.5, 2.75, 12, 0, 1.8, 0, '#eceff2');
+    V(body, 2.3, 0.35, 4, 0, 3.35, 1, '#d0d4d8');
+    V(emit, 2.52, 0.9, 10.2, 0, 2.45, 0.5, col('#ffd9a8', 0.6));     // 車内の灯り
+    for (let z = -4.4; z <= 5.5; z += 1.45) V(body, 2.54, 0.92, 0.14, 0, 2.45, z, '#111');
+    V(body, 2.3, 1.5, 0.06, 0, 2.2, -6.02, C.glass);
+    V(emit, 1.5, 0.22, 0.05, 0, 2.98, -6.04, col('#ff8a00', 1.8));    // 行先表示
+    V(emit, 1.8, 0.5, 0.05, 0, 2.6, 6.02, col('#ffd9a8', 0.35));
+    V(body, 2.54, 0.22, 11.8, 0, 1.25, 0, s1c);
+    V(body, 2.54, 0.12, 11.8, 0, 1.55, 0, s2c);
+    for (const z of [-3.9, 3.7]) for (const x of [-1.08, 1.08]) V(body, 0.36, 1.0, 1.0, x, 0.5, z, C.tire);
+    for (const x of [-0.85, 0.85]) V(emit, 0.36, 0.16, 0.06, x, 0.85, -6.02, HEAD);
+    for (const x of [-1.0, 1.0]) V(tail, 0.22, 0.5, 0.06, x, 1.0, 6.02, WHITE);
+    for (const [list, sx] of [[bl, -1], [br, 1]]) {
+      V(list, 0.14, 0.16, 0.07, sx * 1.17, 0.85, -6.02, WHITE);
+      V(list, 0.22, 0.2, 0.07, sx * 1.0, 1.45, 6.02, WHITE);
+    }
+  }
+
+  const group = new THREE.Group();
+  const mk = (list, mat) => {
+    const m = new THREE.Mesh(mergeGeometries(list), mat);
+    list.forEach((x) => x.dispose());
+    group.add(m);
+    return m;
+  };
+  mk(body, MAT.car);
+  mk(emit, MAT.emit);
+  const tailMat = new THREE.MeshBasicMaterial({ color: TAIL.clone() });
+  mk(tail, tailMat);
+  const blinkL = mk(bl, MAT.blinkOff), blinkR = mk(br, MAT.blinkOff);
+
+  const sh = new THREE.Mesh(new THREE.PlaneGeometry(wid + 0.6, len + 0.8).rotateX(-Math.PI / 2), MAT.shadow);
+  sh.position.y = 0.03; group.add(sh);
+  const hp = new THREE.Mesh(new THREE.PlaneGeometry(wid + 3, 20).rotateX(-Math.PI / 2), MAT.headPool);
+  hp.position.set(0, 0.06, -(len / 2 + 9)); hp.layers.set(1); group.add(hp);
+  const tp = new THREE.Mesh(new THREE.PlaneGeometry(wid + 1.2, 4).rotateX(-Math.PI / 2), MAT.tailPool);
+  tp.position.set(0, 0.06, len / 2 + 1.6); tp.layers.set(1); group.add(tp);
+
+  return { group, blinkL, blinkR, tailMat, len, wid, type };
+}
+
+const vehicles = [];
+const LANE_CHANGE_PRE = 1.8;     // ウインカーを出してから動き始めるまで [s]
+const laneStats = { ok: 0, gaveUp: 0 };   // 自車の車線変更の結果（録画時に一緒に保存する）
+
+function spawnVehicle(type, s, lane, speed, isPlayer = false) {
+  const v = {
+    ...makeVehicle(type, isPlayer), s, lane, lat: LANES[lane], latVel: 0, speed, desired: speed,
+    signal: 0, signalT: 0, pending: -1, moving: false, isPlayer, think: rand(1, 4), braking: false,
+  };
+  scene.add(v.group);
+  vehicles.push(v);
+  return v;
+}
+function removeVehicle(i) {
+  const v = vehicles[i];
+  scene.remove(v.group);
+  v.group.traverse((o) => o.geometry && o.geometry.dispose());
+  v.tailMat.dispose();
+  vehicles.splice(i, 1);
+}
+
+const laneOf = (v) => Math.round(v.lat / LANE_W) + 1;
+const occupies = (u, lane) => u.lane === lane || laneOf(u) === lane;
+
+// 車線 lane に入れる隙間があるか。margin > 1 で余裕を多めに見る。塞いでいる車を返す（空いていれば null）
+function blockerIn(v, lane, margin = 1) {
+  for (const u of vehicles) {
+    if (u === v || !occupies(u, lane)) continue;
+    const ds = u.s - v.s, half = (u.len + v.len) / 2;
+    if (ds >= 0) { if (ds - half < (5 + Math.max(0, v.speed - u.speed) * 2) * margin) return u; }
+    else if (-ds - half < (5 + Math.max(0, u.speed - v.speed) * 2.5) * margin) return u;
+  }
+  return null;
+}
+const isFree = (v, lane, margin = 1) => lane >= 0 && lane <= 2 && !blockerIn(v, lane, margin);
+function leaderOf(v) {
+  let best = null, bd = Infinity;
+  const l1 = v.lane, l2 = laneOf(v);
+  for (const u of vehicles) {
+    if (u === v || !(occupies(u, l1) || occupies(u, l2))) continue;
+    const ds = u.s - v.s;
+    if (ds > 0 && ds < bd) { bd = ds; best = u; }
+  }
+  return best ? { u: best, gap: bd - (best.len + v.len) / 2 } : null;
+}
+function requestChange(v, dir) {
+  if (v.signal) return;
+  v.signal = dir; v.signalT = 0; v.pending = v.lane + dir; v.moving = false;
+}
+
+function updateVehicle(v, dt) {
+  // --- 判断
+  v.think -= dt;
+  if (v.isPlayer) {
+    if (v.think <= 0 && !v.signal) {
+      // ウインカーを出してから動くまでに状況が変わるので、余裕を見て空いている側だけ選ぶ
+      const dirs = v.lane === 0 ? [1] : v.lane === 2 ? [-1] : (chance(0.5) ? [1, -1] : [-1, 1]);
+      const dir = dirs.find((d) => isFree(v, v.lane + d, 1.6));
+      if (dir) { requestChange(v, dir); v.think = rand(12, 26); }
+      else v.think = rand(2, 4);   // どちらも詰まっているので少し待って見直す
+    }
+    if (!PV && chance(dt * 0.1)) v.desiredTarget = rand(22, 28);
+    v.desired += (v.desiredTarget - v.desired) * dt * 0.2;
+  } else if (v.think <= 0 && !v.signal) {
+    v.think = rand(1.5, 4);
+    const L = leaderOf(v);
+    if (L && L.gap < 40 && L.u.speed < v.desired - 1.5) {
+      for (const d of chance(0.5) ? [1, -1] : [-1, 1]) if (isFree(v, v.lane + d)) { requestChange(v, d); break; }
+    } else if (v.lane > 0 && chance(0.15) && isFree(v, v.lane - 1)) {
+      requestChange(v, -1);   // 左に戻る
+    }
+  }
+
+  // --- ウインカーと車線変更
+  v.gapAdjust = 0;
+  if (v.signal) {
+    v.signalT += dt;
+    if (!v.moving) {
+      const b = blockerIn(v, v.pending);
+      if (!b && v.signalT > LANE_CHANGE_PRE) { v.lane = v.pending; v.moving = true; if (v.isPlayer) laneStats.ok++; }
+      else if (b) {
+        // 塞いでいる車の後ろに回るか前に出るかして、隙間を作りにいく
+        v.gapAdjust = b.s > v.s - 2 ? -3.5 : 2.5;
+        if (v.signalT > 9) { v.signal = 0; if (v.isPlayer) laneStats.gaveUp++; }   // それでも入れないときだけ諦める
+      }
+    } else if (Math.abs(LANES[v.lane] - v.lat) < 0.12 && Math.abs(v.latVel) < 0.3) {
+      v.signal = 0; v.moving = false;
+    }
+  }
+  const acc = (LANES[v.lane] - v.lat) * 2.2 - v.latVel * 2.8;
+  v.latVel += acc * dt;
+  v.lat += v.latVel * dt;
+
+  // --- 速度（前の車に合わせる）
+  let tgt = v.desired + v.gapAdjust;
+  const L = leaderOf(v);
+  if (L) {
+    const want = 6 + v.speed * 0.9;
+    if (L.gap < want) tgt = Math.min(tgt, L.u.speed + (L.gap - want) * 0.4);
+  }
+  const a = THREE.MathUtils.clamp((tgt - v.speed) * 0.9, -7, 1.8);
+  v.speed = Math.max(0, v.speed + a * dt);
+  if (L && L.gap < 1) v.speed = Math.min(v.speed, L.u.speed);
+  v.braking = a < -1.2;
+  v.s += v.speed * dt;
+
+  // --- 見た目
+  sample(v.s, v.lat, P);
+  v.group.position.set(P.x, ROAD_Y, P.z);
+  v.group.rotation.y = -(P.h + Math.atan2(v.latVel, Math.max(v.speed, 1)));
+  const on = v.signal !== 0 && (v.signalT % 0.8) < 0.45;
+  v.blinkL.material = on && v.signal < 0 ? MAT.blinkOn : MAT.blinkOff;
+  v.blinkR.material = on && v.signal > 0 ? MAT.blinkOn : MAT.blinkOff;
+  v.tailMat.color.copy(v.braking ? BRAKE : TAIL);
+}
+
+function randType() { const r = Math.random(); return r < 0.55 ? 'sedan' : r < 0.8 ? 'truck' : 'bus'; }
+function desiredFor(type) { return type === 'sedan' ? rand(19, 31) : type === 'truck' ? rand(18, 23) : rand(21, 26); }
+
+// faster: 後ろから来て抜いていく車 / それ以外: 前にいて抜かれる車
+function trySpawn(s, faster) {
+  const type = randType(), lane = randInt(0, 3);
+  for (const u of vehicles) if (occupies(u, lane) && Math.abs(u.s - s) < 30) return false;
+  let desired = desiredFor(type);
+  desired = faster ? Math.max(desired, player.speed + rand(2.5, 7)) : Math.min(desired, player.speed - rand(1.5, 6));
+  spawnVehicle(type, s, lane, Math.max(desired, 12));
+  return true;
+}
+
+let spawnT = 0;
+function manageTraffic(dt) {
+  for (let i = vehicles.length - 1; i >= 0; i--) {
+    const v = vehicles[i];
+    if (v.isPlayer) continue;
+    const d = v.s - player.s;
+    if (d < -150 || d > 420) removeVehicle(i);
+  }
+  spawnT -= dt;
+  if (spawnT <= 0) {
+    spawnT = 0.6;
+    if (vehicles.length - 1 < params.traffic) {
+      const faster = chance(0.4);
+      trySpawn(faster ? player.s - rand(90, 120) : player.s + rand(250, 340), faster);
+    }
+  }
+}
+
+// ============================================================
+// 照明の PointLight（近くの照明にだけ本物のライトを割り当てる）
+// ============================================================
+const LAMP_LIGHTS = 6, LAMP_I = 45;
+const lampLights = [];
+for (let i = 0; i < LAMP_LIGHTS; i++) {
+  const L = new THREE.PointLight(0xffa24a, 0, 34, 1.6);
+  scene.add(L); lampLights.push(L);
+}
+function updateLampLights() {
+  while (lamps.length && lamps[0].s < player.s - 60) lamps.shift();
+  const ref = player.s + 15, cand = [];
+  for (const l of lamps) { if (l.s > player.s + 90) break; cand.push(l); }
+  cand.sort((a, b) => Math.abs(a.s - ref) - Math.abs(b.s - ref));
+  for (let i = 0; i < LAMP_LIGHTS; i++) {
+    const L = lampLights[i], l = cand[i];
+    if (!l) { L.intensity = 0; continue; }
+    sample(l.s, l.lat, P);
+    L.position.set(P.x, l.y - 0.4, P.z);
+    L.intensity = LAMP_I * (1 - THREE.MathUtils.smoothstep(Math.abs(l.s - ref), 35, 54));
+  }
+}
+
+// ============================================================
+// ポストプロセス（ボケ + ブルーム）
+// ============================================================
+const composer = new EffectComposer(renderer);
+composer.setPixelRatio(viewSize()[2]);
+composer.setSize(viewSize()[0], viewSize()[1]);
+composer.addPass(new RenderPass(scene, camera));
+const bokehPass = new BokehPass(scene, camera, { focus: 11, aperture: params.aperture * 1e-5, maxblur: params.maxblur });
+// 光のにじみ類（layer 1）は深度に書かせない。書かせると背景のボケ方が崩れる
+const bokehRender = bokehPass.render.bind(bokehPass);
+bokehPass.render = (...args) => {
+  camera.layers.disable(1);
+  bokehRender(...args);
+  camera.layers.enable(1);
+};
+composer.addPass(bokehPass);
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), params.bloom, params.radius, params.threshold);
+composer.addPass(bloomPass);
+composer.addPass(new OutputPass());
+
+const gui = new GUI({ title: '設定（G で表示切替）' });
+gui.add(params, 'bokeh').name('ボケ').onChange((v) => { bokehPass.enabled = v; });
+gui.add(params, 'aperture', 0, 60, 0.5).name('ボケの強さ').onChange((v) => { bokehPass.uniforms.aperture.value = v * 1e-5; });
+gui.add(params, 'maxblur', 0, 0.03, 0.001).name('ボケの上限').onChange((v) => { bokehPass.uniforms.maxblur.value = v; });
+gui.add(params, 'bloom', 0, 3, 0.05).name('発光の強さ').onChange((v) => { bloomPass.strength = v; });
+gui.add(params, 'threshold', 0, 2, 0.05).name('発光のしきい値').onChange((v) => { bloomPass.threshold = v; });
+gui.add(params, 'radius', 0, 1.5, 0.05).name('発光の広がり').onChange((v) => { bloomPass.radius = v; });
+gui.add(params, 'exposure', 0.3, 2.5, 0.05).name('露出');
+gui.add(params, 'fog', 0, 0.012, 0.0002).name('霧').onChange((v) => { scene.fog.density = v; });
+gui.add(params, 'traffic', 0, 25, 1).name('交通量');
+gui.add(params, 'autoCam').name('カメラ自動切替（C で次へ）');
+gui.add(params, 'music', 0, 1, 0.05).name('音楽の音量').onChange((v) => { if (snd.ctx) snd.music.gain.value = v; });
+gui.add(params, 'sfx', 0, 1.5, 0.05).name('効果音の音量').onChange((v) => { if (snd.ctx) snd.sfx.gain.value = v; });
+gui.close();
+addEventListener('keydown', (e) => { if (e.key === 'g' || e.key === 'G') gui.show(gui._hidden); });
+
+// ============================================================
+// サウンド（音楽も効果音も Web Audio で合成。音源ファイルは使わない）
+// ============================================================
+// ブラウザの自動再生制限があるので、最初のクリック / キー入力で鳴り始める
+const snd = { ctx: null, master: null, music: null, sfx: null, noise: null, delaySend: null, muted: false, blinkPrev: false };
+const midiHz = (n) => 440 * 2 ** ((n - 69) / 12);
+const BPM = 76, BEAT = 60 / BPM, STEP = BEAT / 4;
+
+// チルめの進行: Fmaj7 → Em7 → Dm7 → Cmaj7 を基本に、たまに Am7 始まりへ
+const PROG_A = [{ n: [53, 57, 60, 64], b: 41 }, { n: [52, 55, 59, 62], b: 40 }, { n: [50, 53, 57, 60], b: 38 }, { n: [48, 52, 55, 59], b: 36 }];
+const PROG_B = [{ n: [57, 60, 64, 67], b: 45 }, { n: [53, 57, 60, 64], b: 41 }, { n: [50, 53, 57, 60], b: 38 }, { n: [52, 57, 59, 62], b: 40 }];
+const SONG = [...PROG_A, ...PROG_A, ...PROG_B, ...PROG_A];
+const PENTA = [72, 74, 76, 79, 81, 84];
+
+function initAudio() {
+  if (snd.ctx) { if (!document.hidden) snd.ctx.resume(); return; }
+  const ctx = new AudioContext();
+  snd.ctx = ctx;
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.ratio.value = 3;
+  snd.master = ctx.createGain();
+  comp.connect(snd.master).connect(ctx.destination);
+
+  const warm = ctx.createBiquadFilter();        // ローファイっぽく高域を丸める
+  warm.type = 'lowpass'; warm.frequency.value = 5200;
+  snd.music = ctx.createGain(); snd.music.gain.value = params.music;
+  snd.music.connect(warm).connect(comp);
+  snd.sfx = ctx.createGain(); snd.sfx.gain.value = params.sfx;
+  snd.sfx.connect(comp);
+
+  const nb = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+  const nd = nb.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  snd.noise = nb;
+
+  // 付点8分のディレイ（鍵盤とベル用）
+  const delay = ctx.createDelay(2); delay.delayTime.value = BEAT * 0.75;
+  const fb = ctx.createGain(); fb.gain.value = 0.35;
+  const dl = ctx.createBiquadFilter(); dl.type = 'lowpass'; dl.frequency.value = 2200;
+  delay.connect(dl); dl.connect(fb); fb.connect(delay); dl.connect(snd.music);
+  snd.delaySend = ctx.createGain(); snd.delaySend.gain.value = 0.3;
+  snd.delaySend.connect(delay);
+
+  // レコードのプチプチ
+  const cb = ctx.createBuffer(1, ctx.sampleRate * 3, ctx.sampleRate);
+  const cd = cb.getChannelData(0);
+  for (let i = 0; i < cd.length; i++) cd[i] = (Math.random() < 0.0006 ? (Math.random() * 2 - 1) * 0.8 : 0) + (Math.random() * 2 - 1) * 0.01;
+  const cs = ctx.createBufferSource(); cs.buffer = cb; cs.loop = true;
+  const chp = ctx.createBiquadFilter(); chp.type = 'highpass'; chp.frequency.value = 800;
+  const cg = ctx.createGain(); cg.gain.value = 0.12;
+  cs.connect(chp).connect(cg).connect(snd.music);
+  cs.start();
+
+  nextT = ctx.currentTime + 0.1;
+  setInterval(scheduler, 25);
+}
+addEventListener('pointerdown', initAudio);
+addEventListener('keydown', initAudio);
+document.addEventListener('visibilitychange', () => {
+  if (!snd.ctx) return;
+  if (document.hidden) snd.ctx.suspend(); else snd.ctx.resume();
+});
+addEventListener('keydown', (e) => {
+  if ((e.key === 'm' || e.key === 'M') && snd.ctx) {
+    snd.muted = !snd.muted;
+    snd.master.gain.setTargetAtTime(snd.muted ? 0 : 1, snd.ctx.currentTime, 0.05);
+  }
+});
+
+// ---- 音作りの部品
+function noiseSrc(t, dur) {
+  const s = snd.ctx.createBufferSource();
+  s.buffer = snd.noise; s.loop = true;
+  s.start(t, Math.random() * 1.5); s.stop(t + dur + 0.05);
+  return s;
+}
+function envGain(t, a, peak, d) {
+  const g = snd.ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(peak, t + a);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+  return g;
+}
+function osc(type, f, t, dur) {
+  const o = snd.ctx.createOscillator();
+  o.type = type; o.frequency.value = f;
+  o.start(t); o.stop(t + dur + 0.05);
+  return o;
+}
+function filt(type, f, q = 0.7) {
+  const b = snd.ctx.createBiquadFilter();
+  b.type = type; b.frequency.value = f; b.Q.value = q;
+  return b;
+}
+
+// ---- 楽器
+function epiano(t, f, vel, dur) {
+  const g = envGain(t, 0.008, vel, dur);
+  osc('sine', f, t, dur).connect(g);
+  const tine = envGain(t, 0.004, vel * 0.3, 0.25);
+  osc('sine', f * 2, t, 0.3).connect(tine).connect(g);
+  g.connect(snd.music);
+  const send = snd.ctx.createGain(); send.gain.value = 0.25;
+  g.connect(send).connect(snd.delaySend);
+}
+function chordHit(t, notes, vel) {
+  notes.forEach((n, k) => epiano(t + k * 0.018, midiHz(n), vel, 1.8));   // 少しずらしてストラム
+}
+function pad(t, notes, dur) {
+  const ctx = snd.ctx;
+  for (const n of notes) {
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.022, t + 1.2);
+    g.gain.setValueAtTime(0.022, t + dur - 0.2);
+    g.gain.linearRampToValueAtTime(0.0001, t + dur + 0.8);
+    const lp = filt('lowpass', 900);
+    for (const det of [-8, 8]) {
+      const o = osc('sawtooth', midiHz(n), t, dur + 0.8);
+      o.detune.value = det;
+      o.connect(lp);
+    }
+    lp.connect(g).connect(snd.music);
+  }
+}
+function bass(t, n, dur) {
+  const g = envGain(t, 0.01, 0.32, dur);
+  osc('triangle', midiHz(n), t, dur).connect(filt('lowpass', 300)).connect(g).connect(snd.music);
+}
+function kick(t) {
+  const o = osc('sine', 110, t, 0.4);
+  o.frequency.setValueAtTime(110, t);
+  o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+  o.connect(envGain(t, 0.002, 0.7, 0.38)).connect(snd.music);
+}
+function snare(t) {
+  noiseSrc(t, 0.25).connect(filt('bandpass', 1700)).connect(envGain(t, 0.002, 0.18, 0.2)).connect(snd.music);
+  osc('triangle', 185, t, 0.1).connect(envGain(t, 0.002, 0.08, 0.08)).connect(snd.music);
+}
+function hat(t, v) {
+  noiseSrc(t, 0.06).connect(filt('highpass', 7000)).connect(envGain(t, 0.001, v, 0.035)).connect(snd.music);
+}
+function bell(t, n, v) {
+  const g = envGain(t, 0.005, v, 1.2);
+  osc('sine', midiHz(n), t, 1.2).connect(g);
+  osc('sine', midiHz(n) * 3, t, 0.4).connect(envGain(t, 0.003, v * 0.2, 0.3)).connect(g);
+  g.connect(snd.music);
+  const send = snd.ctx.createGain(); send.gain.value = 0.6;
+  g.connect(send).connect(snd.delaySend);
+}
+
+// ---- シーケンサ（16分音符単位、裏拍を少し遅らせてスウィング）
+let step = 0, nextT = 0;
+function scheduler() {
+  const ctx = snd.ctx;
+  if (ctx.state !== 'running') return;
+  if (nextT < ctx.currentTime - 0.5) nextT = ctx.currentTime + 0.05;
+  while (nextT < ctx.currentTime + 0.15) {
+    playStep(step, nextT + (step % 2 ? STEP * 0.28 : 0));
+    nextT += STEP; step++;
+  }
+}
+function playStep(i, t) {
+  const s = i % 16, ch = SONG[Math.floor(i / 16) % SONG.length];
+  if (s === 0) { pad(t, ch.n, BEAT * 4); chordHit(t, ch.n, 0.15); bass(t, ch.b, BEAT * 1.6); }
+  if (s === 6 && chance(0.6)) chordHit(t, ch.n, 0.09);
+  if (s === 11 && chance(0.35)) chordHit(t, ch.n, 0.07);
+  if (s === 10 && chance(0.7)) bass(t, ch.b + (chance(0.5) ? 7 : 12), BEAT * 0.9);
+  if (i >= 32) {   // 最初の2小節はドラム無し
+    if (s === 0 || (s === 10 && chance(0.5)) || (s === 7 && chance(0.25))) kick(t);
+    if (s === 4 || s === 12) snare(t);
+    if (s % 2 === 0) hat(t, s % 4 === 0 ? 0.07 : 0.045);
+    else if (chance(0.15)) hat(t, 0.025);
+  }
+  if (s % 2 === 0 && chance(0.13)) bell(t, pick(PENTA), 0.07);
+}
+
+// ---- 効果音
+// 横を車が通り過ぎる音。バンドパスを下げていってドップラーっぽくする
+function sfxPass(v) {
+  const ctx = snd.ctx;
+  const t = ctx.currentTime, big = v.type !== 'sedan';
+  const rel = Math.abs(v.speed - player.speed);
+  const dur = THREE.MathUtils.clamp(2.4 - rel * 0.12, 1.0, 2.4) * (big ? 1.3 : 1);
+  const peak = (0.35 + Math.min(rel, 10) * 0.04) * (big ? 1.4 : 1);
+  const side = Math.sign(v.lat - player.lat) || 1;
+
+  const pan = ctx.createStereoPanner();
+  pan.pan.setValueAtTime(side * 0.3, t);
+  pan.pan.linearRampToValueAtTime(side * 0.85, t + dur * 0.4);
+  pan.pan.linearRampToValueAtTime(side * 0.3, t + dur);
+  pan.connect(snd.sfx);
+
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + dur * 0.4);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  g.connect(pan);
+
+  const bp = filt('bandpass', big ? 500 : 900, 0.9);
+  bp.frequency.setValueAtTime(big ? 500 : 900, t);
+  bp.frequency.exponentialRampToValueAtTime(big ? 180 : 320, t + dur);
+  noiseSrc(t, dur).connect(bp).connect(g);
+
+  if (big) {   // トラック・バスは低いうなりを足す
+    const o = osc('sawtooth', 62, t, dur);
+    o.frequency.setValueAtTime(62, t);
+    o.frequency.linearRampToValueAtTime(48, t + dur);
+    const rg = ctx.createGain(); rg.gain.value = 0.5;
+    o.connect(filt('lowpass', 180)).connect(rg).connect(g);
+  }
+}
+// ウインカーのカチ・コチ
+function sfxBlink(on) {
+  const t = snd.ctx.currentTime, f = on ? 2400 : 1500;
+  noiseSrc(t, 0.03).connect(filt('bandpass', f, 4)).connect(envGain(t, 0.001, 0.6, 0.012)).connect(snd.sfx);
+  osc('sine', f / 2, t, 0.03).connect(envGain(t, 0.001, 0.1, 0.02)).connect(snd.sfx);
+}
+
+function updateSound() {
+  if (!snd.ctx || snd.ctx.state !== 'running') return;
+  const on = player.signal !== 0 && (player.signalT % 0.8) < 0.45;
+  if (on !== snd.blinkPrev) { sfxBlink(on); snd.blinkPrev = on; }
+  for (const v of vehicles) {
+    if (v.isPlayer) continue;
+    // 0.5秒後の前後関係で判定して、音のピークがすれ違う瞬間に来るようにする
+    const pred = v.s - player.s + (v.speed - player.speed) * 0.5;
+    if (v.passPrev !== undefined && Math.sign(pred) !== Math.sign(v.passPrev) && Math.abs(v.lat - player.lat) < 5.5) sfxPass(v);
+    v.passPrev = pred;
+  }
+}
+
+// ============================================================
+// 起動
+// ============================================================
+const player = spawnVehicle('sedan', 150, 2, 25, true);   // 第3車線からスタート
+player.desiredTarget = 25;
+const spot = new THREE.SpotLight(0xfff0d8, 90, 70, 0.42, 0.7, 1.4);
+spot.position.set(0, 0.8, -2.2);
+spot.target.position.set(0, -0.5, -25);
+player.group.add(spot, spot.target);
+
+updateChunks(player.s);
+for (let i = 0; i < 14; i++) {
+  const s = player.s + rand(-60, 300);
+  trySpawn(s, s < player.s);
+}
+
+// ============================================================
+// カメラ（ランダムにアングルを切り替える）
+// ============================================================
+// 各アングルは自車からの相対位置。ds: 道なり前後, dl: 左右, y: 高さ（t〜 は注視点）
+// side: 左右どちらから撮るか (±1), u: そのアングルになってからの秒数（ゆっくり動かす用）
+const CAM_MODES = [
+  { name: '後方', w: 3, f: (side, u) => ({ ds: -11, dl: 0, y: 3.4, tds: 12, tdl: 0, ty: 1.1 }) },
+  { name: '正面', w: 1.5, needFront: true, f: (side, u) => ({ ds: 10 - u * 0.15, dl: side * 0.6, y: 1.6, tds: 0, tdl: 0, ty: 0.8 }) },
+  { name: '斜め前', w: 2, needFront: true, f: (side, u) => ({ ds: 8 - u * 0.2, dl: side * 4.2, y: 2.2, tds: 0, tdl: 0, ty: 0.8 }) },
+  { name: '斜め後ろ', w: 2, f: (side, u) => ({ ds: -9, dl: side * (4.5 - u * 0.15), y: 2.6, tds: 5, tdl: 0, ty: 0.9 }) },
+  { name: '斜め上空', w: 2, high: true, f: (side, u) => ({ ds: -30 + u * 0.8, dl: side * 6, y: 30 - u * 0.6, tds: 14, tdl: -side * 1.5, ty: 0 }) },
+  { name: '真上', w: 1, high: true, f: (side, u) => ({ ds: -6, dl: side * 2, y: 38 + u * 0.8, tds: 16, tdl: 0, ty: 0 }) },
+  { name: 'ローアングル', w: 1, f: (side, u) => ({ ds: -6.5, dl: side * 1.4, y: 0.45, tds: 20, tdl: 0, ty: 1.4 }) },
+];
+const CUT_P = 0.45;              // 切り替えがカット（瞬時）になる確率。残りはなめらかに移動
+const BLEND_T = 2.2;             // なめらかな移動にかける秒数
+const CAM_LAT_MAX = ROAD_HALF + 0.5;
+
+let camLat = player.lat;
+const cam = { cur: null, prev: null, side: 1, prevSide: 1, u: 0, prevU: 0, blend: 1, left: 0 };
+const lookT = new THREE.Vector3(), focusP = new THREE.Vector3();
+const _cp = new THREE.Vector3(), _ct = new THREE.Vector3(), _pp = new THREE.Vector3(), _pt = new THREE.Vector3();
+
+function frontIsClear() {
+  const L = leaderOf(player);
+  return !L || L.gap > 16;
+}
+// 道路の外に出るとビルに埋まるので、横位置は壁のすぐ上までに抑える
+const camLatOf = (o) => THREE.MathUtils.clamp(camLat + o.dl, -CAM_LAT_MAX, CAM_LAT_MAX);
+// カメラが他の車の車体に埋まるか（低いアングルで隣の車線に車がいると起きる）
+function camBlocked(mode, side, u) {
+  const o = mode.f(side, u), cs = player.s + o.ds, cl = camLatOf(o);
+  for (const v of vehicles) {
+    if (v.isPlayer) continue;
+    const top = v.type === 'sedan' ? 1.6 : 4.0;
+    if (o.y < top + 0.6 && Math.abs(v.s - cs) < v.len / 2 + 2.5 && Math.abs(v.lat - cl) < v.wid / 2 + 0.8) return true;
+  }
+  return false;
+}
+// トンネルの中や手前では、上空アングルだと天井の上から撮ることになる
+const tunnelNear = () => isZone(player.s - 40, 'tunnel') || isZone(player.s, 'tunnel') || isZone(player.s + 100, 'tunnel');
+function switchCamera(cut) {
+  const side = chance(0.5) ? 1 : -1;
+  const nearT = tunnelNear();
+  let pool = CAM_MODES.filter((m) => m !== cam.cur && (!m.needFront || frontIsClear()) && !(m.high && nearT) && !camBlocked(m, side, 0));
+  if (!pool.length) pool = [CAM_MODES[0]];
+  let r = Math.random() * pool.reduce((a, m) => a + m.w, 0), next = pool[0];
+  for (const m of pool) { r -= m.w; if (r <= 0) { next = m; break; } }
+  applyCamera(next, side, cut);
+}
+function applyCamera(next, side, cut) {
+  cam.prev = cam.cur; cam.prevSide = cam.side; cam.prevU = cam.u;
+  cam.cur = next; cam.side = side; cam.u = 0;
+  cam.blend = cut || !cam.prev ? 1 : 0;
+  cam.left = rand(20, 30);
+}
+// 名前でアングルを指定する。使えない状況なら fallback を順に試す
+function setCamera(names, cut) {
+  const side = chance(0.5) ? 1 : -1;
+  for (const name of names) {
+    const m = CAM_MODES.find((x) => x.name === name);
+    if ((m.needFront && !frontIsClear()) || (m.high && tunnelNear()) || camBlocked(m, side, 0)) continue;
+    applyCamera(m, side, cut);
+    return;
+  }
+  applyCamera(CAM_MODES[0], 1, cut);
+}
+
+// PV のカメラ割り（自車の位置 s で切り替える）
+const PV_CAMS = [
+  { s: 0, cams: ['後方'], cut: true },
+  { s: 250, cams: ['斜め上空', '後方'] },                  // 橋が見えてくる
+  { s: 560, cams: ['ローアングル', '斜め後ろ'], cut: true },  // 主塔とケーブルを見上げる
+  { s: 700, cams: ['斜め後ろ', '後方'] },
+  { s: 900, cams: ['斜め前', '斜め後ろ'], cut: true },        // 街に戻る
+  { s: 1060, cams: ['後方'] },                              // トンネルに入る
+  { s: 1220, cams: ['斜め前', '正面', '斜め後ろ'], cut: true }, // オレンジに染まった車
+  { s: 1360, cams: ['斜め後ろ', '後方'] },
+  { s: 1510, cams: ['斜め上空', '後方'] },                  // トンネルを抜けて街へ
+];
+let pvCamIdx = 0;
+function camPose(mode, side, u, pos, tgt) {
+  const o = mode.f(side, u);
+  sample(player.s + o.ds, camLatOf(o), P);
+  const inT = isZone(player.s + o.ds, 'tunnel');
+  pos.set(P.x, ROAD_Y + (inT ? Math.min(o.y, 6.2) : o.y), P.z);
+  sample(player.s + o.tds, camLat + o.tdl, P);
+  tgt.set(P.x, ROAD_Y + o.ty, P.z);
+}
+function updateCamera(dt, t) {
+  camLat += (player.lat - camLat) * (1 - Math.exp(-3 * dt));
+  if (!cam.cur) switchCamera(true);
+  cam.u += dt; cam.prevU += dt;
+  cam.left -= dt;
+  if (PV) {
+    while (pvCamIdx < PV_CAMS.length && player.s >= PV_CAMS[pvCamIdx].s) {
+      const c = PV_CAMS[pvCamIdx++];
+      setCamera(c.cams, c.cut);
+    }
+  } else if (params.autoCam && cam.left <= 0) switchCamera(chance(CUT_P));
+  else if (cam.cur !== CAM_MODES[0] && camBlocked(cam.cur, cam.side, cam.u)) switchCamera(true);
+  else if (cam.cur.high && tunnelNear()) switchCamera(true);
+
+  camPose(cam.cur, cam.side, cam.u, _cp, _ct);
+  if (cam.blend < 1) {
+    cam.blend = Math.min(1, cam.blend + dt / BLEND_T);
+    const k = THREE.MathUtils.smootherstep(cam.blend, 0, 1);
+    camPose(cam.prev, cam.prevSide, cam.prevU, _pp, _pt);
+    _cp.lerpVectors(_pp, _cp, k);
+    _ct.lerpVectors(_pt, _ct, k);
+  }
+  camera.position.copy(_cp);
+  camera.position.y += Math.sin(t * 1.3) * 0.04;
+  lookT.copy(_ct);
+  camera.lookAt(lookT);
+  ground.position.set(Math.round(camera.position.x / 100) * 100, 0, Math.round(camera.position.z / 100) * 100);
+}
+addEventListener('keydown', (e) => { if (e.key === 'c' || e.key === 'C') switchCamera(false); });
+
+function updateAmbient() {
+  const k = tunnelFactor(player.s);
+  hemi.color.lerpColors(AMBIENT.sky[0], AMBIENT.sky[1], k);
+  hemi.groundColor.lerpColors(AMBIENT.ground[0], AMBIENT.ground[1], k);
+  hemi.intensity = THREE.MathUtils.lerp(AMBIENT.intensity[0], AMBIENT.intensity[1], k);
+  scene.fog.color.lerpColors(AMBIENT.fog[0], AMBIENT.fog[1], k);
+  moon.intensity = 0.25 * (1 - k);
+  MAT.car.envMapIntensity = THREE.MathUtils.lerp(0.9, 0.2, k);
+}
+
+// ---- PV: クリックでフェードインして開始、最後はフェードアウト
+// 暗転は画面に板を重ねず露出で行う（録画に写るように）
+const FADE_T = 2;
+const pv = { started: !PV, ended: false, fade: PV ? 0 : 1, fadeTo: PV ? 0 : 1, onEnd: null };
+const pvmsg = document.getElementById('pvmsg');
+function startPV() {
+  pv.started = true;
+  pv.fadeTo = 1;
+  pvmsg.style.opacity = 0;
+  document.body.classList.add('pv-running');
+}
+if (PV) {
+  gui.hide();
+  document.getElementById('hud').style.display = 'none';
+  if (!REC) {
+    pvmsg.textContent = 'クリックで再生';
+    pvmsg.style.display = 'flex';
+  }
+  addEventListener('pointerdown', () => {
+    if (REC) return;
+    if (!pv.started) startPV();
+    else if (pv.ended) location.reload();
+  });
+}
+function updatePV(dt) {
+  pv.fade += THREE.MathUtils.clamp(pv.fadeTo - pv.fade, -dt / FADE_T, dt / FADE_T);
+  renderer.toneMappingExposure = params.exposure * pv.fade;
+  if (!PV || !pv.started || pv.ended || player.s < PV_END) return;
+  pv.ended = true;
+  pv.fadeTo = 0;
+  if (snd.ctx) snd.master.gain.setTargetAtTime(0, snd.ctx.currentTime, 0.7);
+  setTimeout(() => {
+    if (pv.onEnd) { pv.onEnd(); return; }
+    pvmsg.textContent = 'クリックでもう一度';
+    pvmsg.style.opacity = 1;
+    document.body.classList.remove('pv-running');
+  }, 2500);
+}
+
+// ---- 録画: canvas の映像と、全体の音を MediaRecorder で録る
+async function startRecording() {
+  initAudio();
+  await snd.ctx.resume();
+  const dest = snd.ctx.createMediaStreamDestination();
+  snd.master.connect(dest);
+  const stream = new MediaStream([
+    ...renderer.domElement.captureStream(30).getVideoTracks(),
+    ...dest.stream.getAudioTracks(),
+  ]);
+  // 後で ffmpeg で H.264 に変換するので、ここは画質優先で高めのビットレート
+  const rec = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9,opus', videoBitsPerSecond: 12e6, audioBitsPerSecond: 192000 });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = async () => {
+    await fetch('/save?name=pv_stats.json', { method: 'POST', body: JSON.stringify(laneStats) });
+    const res = await fetch('/save?name=pv_raw.webm', { method: 'POST', body: new Blob(chunks, { type: 'video/webm' }) });
+    document.title = res.ok ? 'REC_DONE' : 'REC_FAILED';
+  };
+  pv.onEnd = () => rec.stop();
+  rec.start(1000);
+  startPV();
+}
+if (REC) setTimeout(startRecording, 2000);   // ビルなどの生成とシェーダーのコンパイルが落ち着くのを待つ
+
+const hud = document.getElementById('hud');
+const LANE_NAMES = ['第1車線', '第2車線', '第3車線'];
+let last = performance.now(), t = 0, hudT = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  const sdt = pv.started ? dt : 0;    // PV は開始まで止めておく
+  t += sdt;
+
+  for (const v of vehicles) updateVehicle(v, sdt);
+  manageTraffic(sdt);
+  updateChunks(player.s);
+  updateLampLights();
+  updateCamera(sdt, t);
+  updatePV(dt);
+  updateSound();
+  updateAmbient();
+
+  focusP.copy(player.group.position); focusP.y += 0.8;
+  bokehPass.uniforms.focus.value = camera.position.distanceTo(focusP);
+  MAT.airPts.opacity = (t % 1.6) < 0.5 ? 1 : 0.08;
+
+  hudT -= dt;
+  if (hudT <= 0) {
+    hudT = 0.2;
+    const sig = player.signal < 0 ? ' ◀' : player.signal > 0 ? ' ▶' : '';
+    hud.innerHTML = `<b>${Math.round(player.speed * 3.6)}</b> km/h　${LANE_NAMES[player.lane]}${sig}　📷 ${cam.cur.name}　${!snd.ctx ? '🔈 クリックで音が鳴ります' : snd.muted ? '🔇 M で音を戻す' : '🔊 M でミュート'}`;
+  }
+
+  composer.render(dt);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+addEventListener('resize', () => {
+  if (REC) return;
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

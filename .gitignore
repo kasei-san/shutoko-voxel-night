@@ -1,0 +1,3 @@
+# 録画の出力と、録画用 Chrome のプロファイル
+out/
+tmp_chrome_profile/
